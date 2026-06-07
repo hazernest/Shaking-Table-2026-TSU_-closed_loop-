@@ -12,6 +12,7 @@ from tkinter import filedialog
 from tkinter import messagebox
 from tkinter import ttk
 
+import numpy as np
 import serial
 from serial.tools import list_ports
 
@@ -37,6 +38,9 @@ RESONANCE_MIN_SAMPLES = 64
 RESONANCE_MIN_HZ = 0.5
 RESONANCE_MAX_HZ = 25.0
 RESONANCE_NOTCH_Q = 3.0
+HIGHPASS_FILTER_DEFAULT_HZ = 0.05
+HIGHPASS_FILTER_MIN_HZ = 0.01
+HIGHPASS_FILTER_MAX_HZ = 0.50
 STABILITY_WINDOW_SAMPLES = 25
 STABILITY_MIN_SAMPLES = 60
 STABILITY_STD_THRESHOLD_MS2 = 0.12
@@ -306,6 +310,7 @@ class SerialSenderApp:
         self.resonance_freq_hz = None
         self.resonance_magnitude = None
         self.imported_accel_history = []
+        self.imported_accel_raw = []  # Raw data before baseline correction
         self.imported_sample_interval_s = EXCEL_SAMPLE_INTERVAL_S
         self.import_preview_window = None
         self.import_graph_window = None
@@ -329,7 +334,9 @@ class SerialSenderApp:
         self.record_summary_var = tk.StringVar(value="Send stepper command to record acceleration.")
         self.record_filter_enabled_var = tk.BooleanVar(value=False)
         self.record_filter_window_var = tk.IntVar(value=RECORD_FILTER_DEFAULT_WINDOW)
-        self.resonance_comp_enabled_var = tk.BooleanVar(value=False)
+        self.input_shaping_mode_var = tk.IntVar(value=0)  # 0 = raw commands, 1 = input shaping
+        self.highpass_cutoff_var = tk.DoubleVar(value=HIGHPASS_FILTER_DEFAULT_HZ)
+        self.max_displacement_cm_var = tk.DoubleVar(value=10.0)  # Max displacement in cm
         self.resonance_info_var = tk.StringVar(value="Resonance: not measured")
         self.show_imported_overlay_var = tk.BooleanVar(value=True)
 
@@ -437,12 +444,25 @@ class SerialSenderApp:
 
         ttk.Label(filter_controls, textvariable=self.record_filter_window_var, width=3).grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-        ttk.Checkbutton(
-            filter_controls,
-            text="Resonance comp",
-            variable=self.resonance_comp_enabled_var,
+        # Input shaping mode selection
+        shaping_frame = ttk.LabelFrame(filter_controls, text="Command Mode", padding=(8, 4))
+        shaping_frame.grid(row=0, column=3, sticky="w", padx=(12, 0))
+        
+        ttk.Radiobutton(
+            shaping_frame,
+            text="Raw",
+            variable=self.input_shaping_mode_var,
+            value=0,
             command=self._on_record_filter_changed,
-        ).grid(row=0, column=3, sticky="w", padx=(12, 0))
+        ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        
+        ttk.Radiobutton(
+            shaping_frame,
+            text="Input Shaping",
+            variable=self.input_shaping_mode_var,
+            value=1,
+            command=self._on_record_filter_changed,
+        ).grid(row=0, column=1, sticky="w")
 
         ttk.Checkbutton(
             filter_controls,
@@ -810,7 +830,7 @@ class SerialSenderApp:
 
         samples = filtered_samples
 
-        if self.resonance_comp_enabled_var.get() and self.resonance_freq_hz is not None:
+        if self.input_shaping_mode_var.get() == 1 and self.resonance_freq_hz is not None:
             return self._apply_notch_filter(samples, self.resonance_freq_hz, RESONANCE_NOTCH_Q)
 
         return samples
@@ -918,6 +938,140 @@ class SerialSenderApp:
 
     def _on_record_filter_slider_changed(self, _value):
         self._draw_record_graph()
+    
+    def _on_import_highpass_changed(self, file_name, original_rows):
+        """Called when high-pass filter slider changes in import graph window"""
+        # Update the displayed value to show 2 decimal places
+        current_val = self.highpass_cutoff_var.get()
+        self.highpass_cutoff_var.set(round(current_val, 2))
+        
+        # Reprocess data
+        self._reprocess_imported_data()
+    
+    def _on_max_displacement_changed(self, file_name, original_rows):
+        """Called when max displacement slider changes in import graph window"""
+        # Update the displayed value to show 1 decimal place
+        current_val = self.max_displacement_cm_var.get()
+        self.max_displacement_cm_var.set(round(current_val, 1))
+        
+        # Reprocess data
+        self._reprocess_imported_data()
+    
+    def _reprocess_imported_data(self):
+        """Reprocess imported data with current filter and displacement settings"""
+        if not self.imported_accel_raw:
+            return
+        
+        # Apply baseline correction with current cutoff frequency
+        corrected_values = self._apply_baseline_correction(self.imported_accel_raw.copy())
+        
+        # Apply input shaping if enabled
+        if self.input_shaping_mode_var.get() == 1 and self.resonance_freq_hz is not None:
+            corrected_values = self._apply_input_shaping(
+                corrected_values,
+                self.resonance_freq_hz,
+                self.imported_sample_interval_s
+            )
+        
+        # Calculate scale factor based on max displacement slider
+        max_displacement_m = self.max_displacement_cm_var.get() / 100.0
+        scale_factor = self._calculate_displacement_scale_factor(corrected_values, max_displacement_m)
+        
+        # Apply scale factor to acceleration
+        scaled_values = [a * scale_factor for a in corrected_values]
+        
+        # Update stored data
+        self.imported_accel_history = scaled_values
+        
+        # Regenerate motion table
+        new_rows = self._generate_motion_table_from_accel(scaled_values)
+        self.import_graph_current_rows = new_rows
+        self.import_generated_rows = new_rows
+        
+        # Redraw all three graphs
+        if hasattr(self, 'import_accel_canvas') and self.import_accel_canvas.winfo_exists():
+            self._draw_import_series_graph(
+                self.import_accel_canvas,
+                [row["accel_mps2"] for row in new_rows],
+                "Acceleration (m/s^2)",
+                "#2563eb",
+            )
+        
+        if hasattr(self, 'import_position_canvas') and self.import_position_canvas.winfo_exists():
+            self._draw_import_series_graph(
+                self.import_position_canvas,
+                [row["position_cm"] for row in new_rows],
+                "Position - Clamped to ±10cm (cm)",
+                "#dc2626",
+            )
+        
+        if hasattr(self, 'import_unclamped_canvas') and self.import_unclamped_canvas.winfo_exists():
+            self._draw_import_series_graph(
+                self.import_unclamped_canvas,
+                [row["unclamped_position_cm"] for row in new_rows],
+                "Position - Actual Earthquake Displacement (cm)",
+                "#16a34a",
+            )
+        
+        # Update table window if it exists
+        self._update_import_table_window(new_rows)
+    
+    def _calculate_displacement_scale_factor(self, accel_values_mps2, target_max_displacement_m):
+        """Calculate scale factor to fit displacement within target max displacement"""
+        # Use FFT method to get displacement
+        displacement_m = self._accel_to_displacement_fft(accel_values_mps2)
+        
+        if not displacement_m:
+            return 1.0
+        
+        # Find maximum displacement
+        max_displacement = max(abs(d) for d in displacement_m)
+        
+        # If displacement is zero or very small, no scaling needed
+        if max_displacement < 1e-6:
+            return 1.0
+        
+        # Calculate scale factor
+        scale_factor = target_max_displacement_m / max_displacement
+        
+        return scale_factor
+    
+    def _update_import_table_window(self, new_rows):
+        """Update the import table window with new data"""
+        if not hasattr(self, 'import_preview_window') or not self.import_preview_window:
+            return
+        
+        if not self.import_preview_window.winfo_exists():
+            return
+        
+        # Find the treeview in the window
+        for child in self.import_preview_window.winfo_children():
+            if isinstance(child, ttk.Frame):
+                for subchild in child.winfo_children():
+                    if isinstance(subchild, ttk.Frame):
+                        for item in subchild.winfo_children():
+                            if isinstance(item, ttk.Treeview):
+                                # Clear existing items
+                                item.delete(*item.get_children())
+                                
+                                # Insert new data
+                                for row in new_rows:
+                                    item.insert(
+                                        "",
+                                        "end",
+                                        values=(
+                                            row["index"],
+                                            f"{row['time_s']:.2f}",
+                                            f"{row['accel_cmps2']:.3f}",
+                                            f"{row['accel_mps2']:.4f}",
+                                            row["steps"],
+                                            row["feedrate"],
+                                            row["direction"],
+                                            f"{row['position_cm']:.3f}",
+                                            f"{row['unclamped_position_cm']:.3f}",
+                                        ),
+                                    )
+                                return
 
     def _import_accel_file(self):
         file_path = filedialog.askopenfilename(
@@ -941,17 +1095,99 @@ class SerialSenderApp:
             messagebox.showerror("Import error", "Need at least 2 numeric rows in the first data column.")
             return
 
+        # Store raw data before baseline correction for re-processing when slider changes
+        self.imported_accel_raw = imported_values.copy()
+
+        # Apply baseline correction (less critical with FFT method, but still helps clean data)
+        # FFT method naturally removes DC drift by skipping f=0 bin
+        imported_values = self._apply_baseline_correction(imported_values)
+        
+        # Calculate initial max displacement to set slider default
+        initial_displacement_m = self._accel_to_displacement_fft(imported_values)
+        if initial_displacement_m:
+            initial_max_disp = max(abs(d) for d in initial_displacement_m)
+            # Set slider to actual displacement, capped at 10cm (stroke limit)
+            self.max_displacement_cm_var.set(min(initial_max_disp * 100.0, 10.0))
+        else:
+            self.max_displacement_cm_var.set(10.0)
+        
+        # Apply input shaping for resonance compensation (if enabled and resonance measured)
+        input_shaping_applied = False
+        if self.input_shaping_mode_var.get() == 1 and self.resonance_freq_hz is not None:
+            imported_values = self._apply_input_shaping(
+                imported_values, 
+                self.resonance_freq_hz, 
+                self.imported_sample_interval_s
+            )
+            input_shaping_applied = True
+        
+        # Calculate optimal scaling factor to fit displacement within stroke limits
+        scale_factor = self._calculate_optimal_scale_factor(imported_values)
+        
+        if scale_factor < 1.0:
+            response = messagebox.askyesno(
+                "Amplitude Scaling Recommended",
+                f"The earthquake displacement exceeds ±{STROKE_LIMIT_M * 100:.0f}cm table limits.\n\n"
+                f"Recommended scale factor: {scale_factor:.3f}\n"
+                f"This will preserve the waveform shape while fitting within table stroke.\n\n"
+                f"Original max accel: {max(abs(min(imported_values)), abs(max(imported_values))):.3f} m/s²\n"
+                f"Scaled max accel: {max(abs(min(imported_values)), abs(max(imported_values))) * scale_factor:.3f} m/s²\n"
+                f"{'Input shaping applied for ' + str(self.resonance_freq_hz) + ' Hz resonance' if input_shaping_applied else ''}\n\n"
+                f"Apply scaling?"
+            )
+            
+            if response:
+                imported_values = [a * scale_factor for a in imported_values]
+                status_msg = f"Imported {len(imported_values)} samples from {Path(file_path).name} (scaled by {scale_factor:.3f}x"
+                if input_shaping_applied:
+                    status_msg += f", input shaped for {self.resonance_freq_hz:.1f}Hz"
+                status_msg += f", dt={self.imported_sample_interval_s:.2f}s)"
+                self.record_summary_var.set(status_msg)
+            else:
+                status_msg = f"Imported {len(imported_values)} samples from {Path(file_path).name} (NO SCALING - will clip at ±{STROKE_LIMIT_M * 100:.0f}cm"
+                if input_shaping_applied:
+                    status_msg += f", input shaped for {self.resonance_freq_hz:.1f}Hz"
+                status_msg += ")"
+                self.record_summary_var.set(status_msg)
+        else:
+            status_msg = f"Imported {len(imported_values)} samples from {Path(file_path).name} (fits within stroke limits"
+            if input_shaping_applied:
+                status_msg += f", input shaped for {self.resonance_freq_hz:.1f}Hz"
+            status_msg += f", dt={self.imported_sample_interval_s:.2f}s)"
+            self.record_summary_var.set(status_msg)
+        
         self.imported_accel_history = imported_values
         generated_rows = self._generate_motion_table_from_accel(imported_values)
         merged_commands = self._merge_generated_commands(generated_rows)
         self.import_generated_rows = generated_rows
         self.import_merged_commands = merged_commands
         file_name = Path(file_path).name
-        self.record_summary_var.set(
-            f"Imported {len(imported_values)} samples from {file_name} (assumed cm/s^2 -> m/s^2, dt={self.imported_sample_interval_s:.2f}s)"
-        )
         self._open_import_preview_window(file_name, generated_rows, merged_commands)
         self._draw_record_graph()
+
+    def _calculate_optimal_scale_factor(self, accel_values_mps2):
+        """
+        Calculate the scaling factor needed to fit displacement within stroke limits.
+        Uses FFT method to calculate displacement.
+        Returns a value between 0 and 1.
+        """
+        # Use FFT method to get displacement
+        displacement_m = self._accel_to_displacement_fft(accel_values_mps2)
+        
+        if not displacement_m:
+            return 1.0
+        
+        # Find maximum displacement
+        max_displacement = max(abs(d) for d in displacement_m)
+        
+        # If displacement fits, no scaling needed
+        if max_displacement <= STROKE_LIMIT_M:
+            return 1.0
+        
+        # Calculate required scale factor with 5% safety margin
+        scale_factor = (STROKE_LIMIT_M * 0.95) / max_displacement
+        
+        return scale_factor
 
     def _load_accel_series_from_file(self, file_path):
         suffix = Path(file_path).suffix.lower()
@@ -1014,30 +1250,303 @@ class SerialSenderApp:
         except ValueError:
             return None
 
+    def _apply_baseline_correction(self, accel_values):
+        """
+        Enhanced baseline correction to remove DC offset, polynomial drift, and 
+        very low frequency components that cause position drift.
+        
+        This preserves earthquake frequency content (typically 0.1-20 Hz) while
+        removing baseline drift that causes position to not return to zero.
+        
+        Steps:
+        1. Remove mean (DC offset)
+        2. Remove polynomial trend (quadratic drift)
+        3. Apply high-pass filter (0.05 Hz) to remove very low frequency drift
+        4. Apply post-integration correction to ensure zero final displacement
+        """
+        if not accel_values:
+            return accel_values
+        
+        n = len(accel_values)
+        
+        # Step 1: Remove mean (DC offset)
+        mean = sum(accel_values) / n
+        detrended = [a - mean for a in accel_values]
+        
+        # Step 2: Remove polynomial trend (quadratic fit: y = ax² + bx + c)
+        # This handles parabolic baseline drift better than linear
+        corrected = self._remove_polynomial_trend(detrended)
+        
+        # Step 3: Apply high-pass filter to remove very low frequencies
+        # This removes drift without affecting earthquake content (typically > 0.1 Hz)
+        cutoff_hz = self.highpass_cutoff_var.get()
+        corrected = self._apply_highpass_filter(corrected, cutoff_hz=cutoff_hz)
+        
+        # Step 4: Post-integration drift correction
+        # Simulate integration to check final position, then remove residual drift
+        corrected = self._remove_integration_drift(corrected)
+        
+        return corrected
+    
+    def _remove_polynomial_trend(self, accel_values):
+        """
+        Remove quadratic polynomial trend: y = ax² + bx + c
+        Uses least squares fitting.
+        """
+        if len(accel_values) < 3:
+            return accel_values
+        
+        n = len(accel_values)
+        
+        # Build normal equations for least squares
+        # We need to solve: [X^T X] * [a, b, c]^T = X^T * y
+        sum_x = sum(range(n))
+        sum_x2 = sum(i * i for i in range(n))
+        sum_x3 = sum(i * i * i for i in range(n))
+        sum_x4 = sum(i * i * i * i for i in range(n))
+        
+        sum_y = sum(accel_values)
+        sum_xy = sum(i * accel_values[i] for i in range(n))
+        sum_x2y = sum(i * i * accel_values[i] for i in range(n))
+        
+        # Solve using Cramer's rule (simplified for 3x3 system)
+        # For small datasets, numerical stability is okay
+        try:
+            # Determinant of coefficient matrix
+            det = (n * sum_x2 * sum_x4 + 2 * sum_x * sum_x2 * sum_x3 - 
+                   sum_x2 * sum_x2 * sum_x2 - n * sum_x3 * sum_x3 - sum_x4 * sum_x * sum_x)
+            
+            if abs(det) < 1e-10:
+                # Matrix is singular, fall back to linear detrending
+                m = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x)
+                b = (sum_y - m * sum_x) / n
+                return [accel_values[i] - (m * i + b) for i in range(n)]
+            
+            # Solve for coefficients a, b, c
+            a = ((sum_x2y * (sum_x2 * n - sum_x * sum_x) + 
+                  sum_xy * (sum_x * sum_x3 - sum_x2 * sum_x2) + 
+                  sum_y * (sum_x2 * sum_x2 - sum_x3 * n)) / det)
+            
+            b = ((sum_x2y * (sum_x * sum_x - sum_x2 * n) + 
+                  sum_xy * (sum_x4 * n - sum_x2 * sum_x2) + 
+                  sum_y * (sum_x2 * sum_x2 - sum_x4 * sum_x)) / det)
+            
+            c = ((sum_x2y * (sum_x2 * sum_x - sum_x3 * sum_x) + 
+                  sum_xy * (sum_x3 * sum_x - sum_x2 * sum_x2) + 
+                  sum_y * (sum_x2 * sum_x2 - sum_x3 * sum_x)) / det)
+            
+            # Remove polynomial trend
+            return [accel_values[i] - (a * i * i + b * i + c) for i in range(n)]
+            
+        except (ZeroDivisionError, OverflowError):
+            # Fall back to linear detrending on numerical issues
+            m = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x)
+            b = (sum_y - m * sum_x) / n
+            return [accel_values[i] - (m * i + b) for i in range(n)]
+    
+    def _apply_highpass_filter(self, accel_values, cutoff_hz):
+        """
+        Apply simple high-pass filter (1st order Butterworth) to remove 
+        very low frequency drift without affecting earthquake frequencies.
+        
+        Cutoff at 0.05 Hz preserves all earthquake content (> 0.1 Hz).
+        """
+        if len(accel_values) < 2:
+            return accel_values
+        
+        dt = self.imported_sample_interval_s
+        sample_rate = 1.0 / dt
+        
+        # Calculate filter coefficient (1st order high-pass)
+        RC = 1.0 / (2.0 * math.pi * cutoff_hz)
+        alpha = RC / (RC + dt)
+        
+        # Apply filter: y[i] = alpha * (y[i-1] + x[i] - x[i-1])
+        filtered = [accel_values[0]]  # First sample passes through
+        
+        for i in range(1, len(accel_values)):
+            filtered_value = alpha * (filtered[i-1] + accel_values[i] - accel_values[i-1])
+            filtered.append(filtered_value)
+        
+        return filtered
+    
+    def _remove_integration_drift(self, accel_values):
+        """
+        Remove residual drift by simulating double integration, measuring
+        final position/velocity, and removing a corrective linear ramp.
+        
+        This ensures position returns to zero at the end while preserving
+        the earthquake's frequency content.
+        
+        Mathematical approach:
+        - Add correction: a_corr(t) = a_0 + a_1*t
+        - After integration: v(T) = a_0*T + a_1*T²/2
+        - After 2nd integration: x(T) = a_0*T²/2 + a_1*T³/6
+        - Solve for a_0, a_1 such that final v=0, x=0
+        """
+        if len(accel_values) < 2:
+            return accel_values
+        
+        dt = self.imported_sample_interval_s
+        
+        # Simulate double integration
+        velocity = 0.0
+        position = 0.0
+        
+        for accel in accel_values:
+            velocity += accel * dt
+            position += velocity * dt
+        
+        final_velocity = velocity
+        final_position = position
+        
+        # If final position/velocity are small enough, no correction needed
+        if abs(final_position) < 0.001 and abs(final_velocity) < 0.001:
+            return accel_values
+        
+        n = len(accel_values)
+        total_time = n * dt
+        T = total_time
+        
+        # Solve for correction coefficients:
+        # a_0*T + a_1*T²/2 = -v_f
+        # a_0*T²/2 + a_1*T³/6 = -x_f
+        # 
+        # Solution:
+        # a_1 = 12*x_f/T³ - 6*v_f/T²
+        # a_0 = -6*x_f/T² + 2*v_f/T
+        
+        a_1 = 12.0 * final_position / (T ** 3) - 6.0 * final_velocity / (T ** 2)
+        a_0 = -6.0 * final_position / (T ** 2) + 2.0 * final_velocity / T
+        
+        # Apply correction: a_corr(t) = a_0 + a_1*t
+        corrected = []
+        for i, accel in enumerate(accel_values):
+            t = i * dt
+            correction = a_0 + a_1 * t
+            corrected.append(accel + correction)
+        
+        return corrected
+
+    def _apply_input_shaping(self, accel_values, resonance_hz, sample_interval):
+        """
+        Apply Zero Vibration (ZV) input shaping to suppress resonance.
+        This modifies the commanded acceleration to cancel vibrations at the resonant frequency.
+        
+        Input shaping convolves the command with a shaped impulse sequence that cancels
+        residual vibrations at the system's natural frequency.
+        """
+        if not accel_values or resonance_hz is None or resonance_hz <= 0:
+            return accel_values
+        
+        # ZV shaper parameters
+        omega_n = 2.0 * math.pi * resonance_hz  # Natural frequency (rad/s)
+        zeta = 1.0 / (2.0 * RESONANCE_NOTCH_Q)  # Damping ratio from Q factor
+        omega_d = omega_n * math.sqrt(1.0 - zeta * zeta)  # Damped frequency
+        
+        # ZV shaper impulse times and amplitudes
+        T_v = math.pi / omega_d  # Time between impulses
+        K = math.exp(-zeta * omega_n * T_v)  # Decay factor
+        
+        # Normalized amplitudes
+        A1 = 1.0 / (1.0 + K)
+        A2 = K / (1.0 + K)
+        
+        # Convert time to samples
+        samples_delay = int(round(T_v / sample_interval))
+        
+        if samples_delay <= 0 or samples_delay >= len(accel_values):
+            return accel_values
+        
+        # Convolve with ZV shaper: output[n] = A1*input[n] + A2*input[n-delay]
+        shaped = []
+        for i in range(len(accel_values)):
+            if i < samples_delay:
+                # Before delay, only first impulse contributes
+                shaped.append(A1 * accel_values[i])
+            else:
+                # After delay, both impulses contribute
+                shaped.append(A1 * accel_values[i] + A2 * accel_values[i - samples_delay])
+        
+        return shaped
+
+    def _accel_to_displacement_fft(self, accel_values_mps2):
+        """
+        Convert acceleration to displacement using FFT method.
+        This is more accurate than double integration as it naturally removes DC drift.
+        
+        Mathematical relationship:
+        X(f) = -A(f) / (2πf)²
+        
+        Where:
+        - X(f) = displacement in frequency domain
+        - A(f) = acceleration in frequency domain
+        - f = frequency
+        
+        Uses numpy's fast FFT for O(n log n) performance.
+        """
+        if not accel_values_mps2:
+            return []
+        
+        n = len(accel_values_mps2)
+        dt = self.imported_sample_interval_s
+        sample_rate = 1.0 / dt
+        
+        # Convert to numpy array
+        accel_array = np.array(accel_values_mps2)
+        
+        # Perform FFT on acceleration
+        accel_fft = np.fft.fft(accel_array)
+        
+        # Get frequency bins
+        freqs = np.fft.fftfreq(n, dt)
+        
+        # Convert acceleration to displacement in frequency domain
+        # X(f) = -A(f) / (2πf)²
+        disp_fft = np.zeros_like(accel_fft, dtype=complex)
+        
+        # Skip DC component (f=0) and very low frequencies to avoid division by zero
+        # Frequencies below 0.05 Hz are typically drift, not earthquake content
+        mask = np.abs(freqs) >= 0.05
+        omega = 2.0 * np.pi * freqs[mask]
+        disp_fft[mask] = -accel_fft[mask] / (omega * omega)
+        
+        # Perform IFFT to get displacement in time domain
+        displacement_array = np.fft.ifft(disp_fft).real
+        
+        return displacement_array.tolist()
+    
     def _generate_motion_table_from_accel(self, accel_values_mps2):
+        """
+        Generate motion table from acceleration using FFT-based displacement calculation.
+        This replaces the double integration method with a more accurate frequency domain approach.
+        """
         dt = self.imported_sample_interval_s
         steps_per_meter = PULSES_PER_REV / (LEAD_MM_PER_REV / 1000.0)
-
+        
+        # Convert acceleration to displacement using FFT method
+        unclamped_displacement_m = self._accel_to_displacement_fft(accel_values_mps2)
+        
         rows = []
         current_position_m = 0.0
-        current_velocity_mps = 0.0
         step_residual = 0.0
 
         for index, accel_value in enumerate(accel_values_mps2):
+            # Get target displacement from FFT calculation
+            target_position_m = unclamped_displacement_m[index]
+            
+            # Apply acceleration limiting (still useful for safety)
             limited_accel = max(-SAFE_ACCEL_LIMIT_MPS2, min(SAFE_ACCEL_LIMIT_MPS2, accel_value))
-            target_velocity_mps = current_velocity_mps + limited_accel * dt
-            target_position_m = current_position_m + target_velocity_mps * dt
-
-            if target_position_m > STROKE_LIMIT_M:
-                target_position_m = STROKE_LIMIT_M
-                if target_velocity_mps > 0.0:
-                    target_velocity_mps = 0.0
-            elif target_position_m < -STROKE_LIMIT_M:
-                target_position_m = -STROKE_LIMIT_M
-                if target_velocity_mps < 0.0:
-                    target_velocity_mps = 0.0
-
-            target_delta_m = target_position_m - current_position_m
+            
+            # Clamp position to stroke limits
+            clamped_position_m = target_position_m
+            if clamped_position_m > STROKE_LIMIT_M:
+                clamped_position_m = STROKE_LIMIT_M
+            elif clamped_position_m < -STROKE_LIMIT_M:
+                clamped_position_m = -STROKE_LIMIT_M
+            
+            # Calculate step command
+            target_delta_m = clamped_position_m - current_position_m
             step_float = target_delta_m * steps_per_meter + step_residual
             signed_steps = int(round(step_float))
             step_residual = step_float - signed_steps
@@ -1060,21 +1569,20 @@ class SerialSenderApp:
                     current_position_m = STROKE_LIMIT_M
                 elif current_position_m < -STROKE_LIMIT_M:
                     current_position_m = -STROKE_LIMIT_M
-                current_velocity_mps = actual_delta_m / dt
             else:
                 feedrate = 0
-                current_velocity_mps = 0.0
 
             rows.append(
                 {
                     "index": index,
                     "time_s": index * dt,
                     "accel_cmps2": accel_value / CMPS2_TO_MPS2,
-                    "accel_mps2": accel_value,
+                    "accel_mps2": limited_accel,
                     "steps": step_count,
                     "feedrate": feedrate,
                     "direction": direction,
                     "position_cm": current_position_m * 100.0,
+                    "unclamped_position_cm": target_position_m * 100.0,
                 }
             )
 
@@ -1157,6 +1665,7 @@ class SerialSenderApp:
             "feedrate",
             "direction",
             "position_cm",
+            "unclamped_position_cm",
         )
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=18)
         tree.grid(row=0, column=0, sticky="nsew")
@@ -1170,6 +1679,7 @@ class SerialSenderApp:
             "feedrate": "feedrate",
             "direction": "dir",
             "position_cm": "pos (cm)",
+            "unclamped_position_cm": "actual pos (cm)",
         }
 
         widths = {
@@ -1181,6 +1691,7 @@ class SerialSenderApp:
             "feedrate": 100,
             "direction": 60,
             "position_cm": 100,
+            "unclamped_position_cm": 120,
         }
 
         for column in columns:
@@ -1200,6 +1711,7 @@ class SerialSenderApp:
                     row["feedrate"],
                     row["direction"],
                     f"{row['position_cm']:.3f}",
+                    f"{row['unclamped_position_cm']:.3f}",
                 ),
             )
 
@@ -1270,21 +1782,70 @@ class SerialSenderApp:
         graph_window = tk.Toplevel(self.root)
         self.import_graph_window = graph_window
         graph_window.title(f"Imported Earthquake Graphs - {file_name}")
-        graph_window.geometry("980x460")
+        graph_window.geometry("980x680")
 
         outer = ttk.Frame(graph_window, padding=10)
         outer.grid(row=0, column=0, sticky="nsew")
         graph_window.columnconfigure(0, weight=1)
         graph_window.rowconfigure(0, weight=1)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1)
+        outer.rowconfigure(2, weight=1)
+        outer.rowconfigure(3, weight=1)
 
-        accel_canvas = tk.Canvas(outer, height=200, bg="#f8fafc", highlightthickness=0)
-        accel_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        # Filter and displacement controls at top
+        filter_frame = ttk.Frame(outer)
+        filter_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        filter_frame.columnconfigure(1, weight=1)
+        filter_frame.columnconfigure(4, weight=1)
+        
+        # High-pass filter slider
+        ttk.Label(filter_frame, text="High-pass filter (Hz):").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        
+        ttk.Scale(
+            filter_frame,
+            from_=HIGHPASS_FILTER_MIN_HZ,
+            to=HIGHPASS_FILTER_MAX_HZ,
+            variable=self.highpass_cutoff_var,
+            command=lambda v: self._on_import_highpass_changed(file_name, rows),
+        ).grid(row=0, column=1, sticky="ew")
+        
+        ttk.Label(filter_frame, textvariable=self.highpass_cutoff_var, width=6).grid(row=0, column=2, sticky="e", padx=(8, 0))
+        
+        ttk.Label(filter_frame, text="← Less | More →").grid(row=0, column=3, sticky="w", padx=(8, 16))
+        
+        # Max displacement slider
+        ttk.Label(filter_frame, text="Max displacement (cm):").grid(row=0, column=4, sticky="w", padx=(0, 8))
+        
+        ttk.Scale(
+            filter_frame,
+            from_=0.5,
+            to=10.0,
+            variable=self.max_displacement_cm_var,
+            command=lambda v: self._on_max_displacement_changed(file_name, rows),
+        ).grid(row=0, column=5, sticky="ew")
+        
+        ttk.Label(filter_frame, textvariable=self.max_displacement_cm_var, width=6).grid(row=0, column=6, sticky="e", padx=(8, 0))
+        
+        ttk.Label(filter_frame, text="(scales acceleration, updates table in real-time)").grid(row=0, column=7, sticky="w", padx=(8, 0))
 
-        position_canvas = tk.Canvas(outer, height=200, bg="#f8fafc", highlightthickness=0)
-        position_canvas.grid(row=1, column=0, sticky="nsew")
+        # Store canvas references for updating
+        self.import_accel_canvas = tk.Canvas(outer, height=200, bg="#f8fafc", highlightthickness=0)
+        self.import_accel_canvas.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        
+        accel_canvas = self.import_accel_canvas
+
+        self.import_position_canvas = tk.Canvas(outer, height=200, bg="#f8fafc", highlightthickness=0)
+        self.import_position_canvas.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        position_canvas = self.import_position_canvas
+        
+        self.import_unclamped_canvas = tk.Canvas(outer, height=200, bg="#f8fafc", highlightthickness=0)
+        self.import_unclamped_canvas.grid(row=3, column=0, sticky="nsew")
+        unclamped_canvas = self.import_unclamped_canvas
+        
+        # Store current file name and rows for re-processing
+        self.import_graph_file_name = file_name
+        self.import_graph_current_rows = rows
 
         self._draw_import_series_graph(
             accel_canvas,
@@ -1295,8 +1856,14 @@ class SerialSenderApp:
         self._draw_import_series_graph(
             position_canvas,
             [row["position_cm"] for row in rows],
-            "Position (cm)",
+            "Position - Clamped to ±10cm (cm)",
             "#dc2626",
+        )
+        self._draw_import_series_graph(
+            unclamped_canvas,
+            [row["unclamped_position_cm"] for row in rows],
+            "Position - Actual Earthquake Displacement (cm)",
+            "#16a34a",
         )
 
     def _draw_import_series_graph(self, canvas, values, title, line_color):
@@ -1364,6 +1931,7 @@ class SerialSenderApp:
             "feedrate",
             "direction",
             "position_cm",
+            "unclamped_position_cm",
         ]
 
         output_suffix = Path(output_path).suffix.lower()
@@ -1383,6 +1951,7 @@ class SerialSenderApp:
                             row["feedrate"],
                             row["direction"],
                             round(row["position_cm"], 6),
+                            round(row["unclamped_position_cm"], 6),
                         ])
             else:
                 try:
@@ -1405,6 +1974,7 @@ class SerialSenderApp:
                         row["feedrate"],
                         row["direction"],
                         row["position_cm"],
+                        row["unclamped_position_cm"],
                     ])
 
                 workbook.save(output_path)
