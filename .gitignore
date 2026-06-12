@@ -22,3 +22,7 @@ __pycache__/
 
 # Logs
 *.log
+
+# Build artifacts
+build/
+dist/
